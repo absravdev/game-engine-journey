@@ -427,3 +427,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# --- Project decision ---
+# VS2022 is temporary scaffolding; the real build comes later with CMake (Phase 0.9).
+# VS project files are not versioned: the .cpp is the artifact, not the IDE metadata.
+*.sln
+*.vcxproj
+*.vcxproj.filters
