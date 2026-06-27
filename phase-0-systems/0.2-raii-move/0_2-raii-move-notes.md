@@ -99,6 +99,158 @@ RAII relies on. Everything else in this topic is built on it.
   block, not to the whole function; closing an inner `}` destroys that block's objects
   immediately.
 
+## Exercise 2 — `unique_ptr`: single ownership
+
+Source: `ex2.cpp`.
+
+From `HeapInt` (the hand-made owner of ex1) to `std::unique_ptr`: the stdlib version
+of the exact same RAII idea, generic and tested. The exercise walks single ownership
+end to end — create, fail to copy, transfer with move, the array specialization, and
+the runtime cost.
+
+### 2.1 — What the output shows
+
+```
+p before move:
+  address: 000001DD27D476D0   <- p owns the int (real heap address)
+  value:   42
+after move:
+  p is empty (moved-from, holds nullptr)   <- ownership transferred to q
+  q value: 42                              <- q is the new owner
+0 1 4 9 16                                  <- arr filled with i*i
+sizeof(unique_ptr<int>): 8
+sizeof(int*):            8                  <- identical: zero overhead
+```
+
+The address goes from a real value (`p` owns the int) to `nullptr` (after the move),
+and `q` now holds the `42`. Ownership transfer, visible on screen, not asserted.
+
+### 2.2 — Why `auto q = p;` does not compile (the ownership reason)
+
+`auto q = p;` asks the compiler to **copy** `p`, which needs the copy constructor.
+For `unique_ptr` that constructor is `= delete`, so the copy is rejected at compile
+time:
+
+```
+error C2280: 'std::unique_ptr<int,...>::unique_ptr(const std::unique_ptr<int,...> &)':
+attempting to reference a deleted function
+```
+
+The signature it names takes `const unique_ptr&` — that *is* the copy constructor.
+The reason is **single ownership**: copying would leave `p` and `q` both owning the
+same heap `int`; when both die, each calls `delete` on it → **double-free** (UB). That
+is exactly the 0.1 ex5 danger. The stdlib forbids the copy so the "one owner" invariant
+cannot be violated by accident.
+
+The jump from 0.1: there the shallow copy *compiled fine* and the double-free blew up
+at **runtime** (silent, sometimes didn't even crash). Here the language **refuses to
+compile**. The danger moved from runtime to compile-time — from a silent mine to a loud
+error you see before running.
+
+Copy is deleted, but **move is not**: the move constructor takes `unique_ptr&&` (an
+rvalue reference) and is allowed. "Not copyable, but movable" made concrete in the
+type's special members.
+
+### 2.3 — Transfer with `std::move`; the moved-from state
+
+`auto q = std::move(p);` transfers ownership. `std::move` itself moves nothing — it is
+a cast (`static_cast<T&&>`) that turns the lvalue `p` into an rvalue reference, so the
+**move constructor** is selected instead of the (deleted) copy. The move ctor steals
+`p`'s internal pointer and nulls it.
+
+After the move, `p` is **valid but empty**: for `unique_ptr` the standard guarantees
+`p.get() == nullptr`. Observing a moved-from is safe (`p.get()`, `if (p)`, even
+`cout << p`); dereferencing it is UB (see mistakes).
+
+### 2.4 — `unique_ptr<int[]>`: owning a heap array
+
+`make_unique<int[]>(n)` (note the `[]`) selects the **array specialization**, whose
+destructor calls `delete[]`, not `delete`. It is the safe version of 0.1's raw
+`new[]`/`delete[]`, managed automatically. Notes:
+- it **value-initializes** — the five ints start at `0` (raw `new int[5]` would not
+  guarantee that).
+- access is by index, `arr[i]`; there is no `*arr` for the whole array. `arr.get()`
+  returns an `int*` to the first element.
+
+### 2.5 — Cost: `sizeof(unique_ptr<int>) == sizeof(int*)` (zero overhead)
+
+Measured on x64: **8 == 8**. A `unique_ptr<int>` with the default deleter contains
+exactly one pointer and nothing else — no refcount, no flag. The default deleter
+(`std::default_delete`) is stateless and takes **0 bytes** (empty base optimization).
+
+Runtime cost is **zero**:
+- same size in memory, not one byte extra;
+- `*p` is the same instruction as on a raw pointer — no added indirection;
+- the `delete` in the destructor is **generated code, not stored data** — the same
+  `delete` you'd write by hand in 0.1, but automatic and impossible to forget.
+
+This is a **zero-overhead abstraction**: same cost as the raw pointer used correctly,
+with the correctness enforced by the compiler. That is why `unique_ptr` is the sane
+default in engines.
+
+**Honesty / caveat:** "same size as a raw pointer" holds **with the default, stateless
+deleter**. A *stateful custom deleter* (a function pointer, or a capturing lambda) makes
+the `unique_ptr` grow to store it, and `sizeof` stops matching `int*`. True for the
+common case (the 99%), not a universal law.
+
+### 2.6 — Mistakes I made (the valuable part)
+
+1. **use-after-move: dereferenced a moved-from `unique_ptr`.** After
+   `auto q = std::move(p);`, `p` holds `nullptr`. I reused the three-print template from
+   the "before" block in the "after" block, including `cout << *p`. `*p` on `nullptr`
+   reads address 0 → **access violation** (`exited with code 0xC0000005`,
+   `STATUS_ACCESS_VIOLATION`), a crash. The lesson: **observe** a moved-from (`if (p)`,
+   `.get()`), never **dereference** it. Same sin as 0.1's use-after-free, different mask:
+   using a resource after transferring its ownership. Fix: replaced `*p` with `if (p)`,
+   which observes without dereferencing.
+
+2. **dead loop: a counter set to 0 used as the loop bound.** Wrote
+   `int count = 0; for (i = 0; i < count; ...)` — `count` was `0`, so `i < 0` is false
+   from the first iteration and the body never ran. The array was never filled and never
+   printed. It **compiles and runs clean** (exit 0); only the *missing output* reveals
+   it. Diagnosis came from running it: had I read the program output instead of asking
+   whether the code "looked bad", the empty array section pointed straight at the loop.
+   Fix: a single named size `const std::size_t n`, used in `make_unique<int[]>(n)` and in
+   both loop bounds — one source of truth, can't desync (duplicated sizes that drift are
+   a real cause of buffer overruns).
+
+**Process note:** I pasted code and asked "is this wrong?" *without running it*. The
+compiler and the runtime are the source of truth, not eyeballing. Run first, then read
+the output — the output is what diagnoses.
+
+### 2.7 — Process / style notes
+
+- The `cout << p` (without `.get()`) line was a deliberate experiment: it confirmed that
+  in **C++20**, `cout << unique_ptr` prints the same address as `p.get()`. C++20 added an
+  `operator<<` for `unique_ptr` that forwards to `os << get()`; in **C++17** the same line
+  does **not** compile. Kept the finding here, dropped the redundant line from the final
+  program — prefer the explicit `p.get()`, which states the non-owning *observe* and is
+  portable to C++17.
+- MSVC prints addresses as 16 hex digits, uppercase, no `0x` (e.g. `000001DD27D476D0`);
+  g++ prints lowercase with `0x`. The textual representation is implementation-defined;
+  the value is the same idea.
+
+### New concepts
+
+- **single ownership** — exactly one owner of a resource at a time (the `unique_ptr`
+  model). Transfer (move) is allowed; duplicate (copy) is not.
+- **copy = deleted** — `unique_ptr`'s copy constructor and copy assignment are `= delete`;
+  any copy is a compile-time error (`C2280`), enforcing single ownership.
+- **`std::move` is a cast** — `static_cast<T&&>` that turns an lvalue into an rvalue
+  reference so the move ctor is selected. It moves nothing itself; pure compile-time.
+- **moved-from = valid but empty** — after a move the source is valid (safe to destroy or
+  reassign) but empty (`unique_ptr` holds `nullptr`). Observing is safe; dereferencing is
+  UB.
+- **`unique_ptr<int[]>`** — array specialization: destructor uses `delete[]`, access via
+  `operator[]`, `make_unique` value-initializes.
+- **zero-overhead abstraction** — `unique_ptr` (default deleter) costs the same as a raw
+  pointer in size and speed, with correctness enforced by the compiler. Caveat: a stateful
+  custom deleter adds size.
+- **owner vs observer** — the owner (`unique_ptr`) is responsible for freeing and frees on
+  death; an observer (raw `int*` from `.get()`) points without owning and never frees. The
+  difference is behaviour plus a compile-time contract, **not bytes** — it does not appear
+  in `sizeof`.
+
 ---
 
-_Exercises 2–5 will be added here when completed._
+_Exercises 3–5 will be added here when completed._
